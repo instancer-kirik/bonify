@@ -13,7 +13,7 @@ add bone with weights
 ![image](https://github.com/user-attachments/assets/07a7b4d8-12ee-4ac1-84ca-9d137b2d1d9d)
 ![image](https://github.com/user-attachments/assets/c41ee1a0-566d-4d28-b210-91ca1913ffbb)
 
-### Hark-- Vertex Groups, Armature modifier, UNAPPLIED TRANSFORMS - I think this solves that for you, but if it is in wrong place try Ctrl+a > all transforms. 
+### Hark-- Vertex Groups, Armature modifier, UNAPPLIED TRANSFORMS - I think this solves that for you, but if it is in wrong place try Ctrl+a > all transforms. If your object is not moving by the bone in pose mode, you probably duplicated to get it, renaming it might solve this
 
 
 if you get a Encoding error: 'utf-8' codec can't decode byte 0x9f in position 2: invalid start byte
