@@ -18,17 +18,19 @@ add bone with weights
 
 if you get a Encoding error: 'utf-8' codec can't decode byte 0x9f in position 2: invalid start byte
 or a Encoding error: 'utf-8' codec can't decode byte 0xd0 in position 0: invalid continuation byte
-buy me dinner first because I fixed it
+buy me dinner first because I fixed it. Open an issue if this occurs.
 
 TODO if you pay me $Instancer
 
 prevent duplicate bones
 
+hotkey and better direction selection
+
 group selection actions
 
 selection macros
 
-custom bone namings (currently it just takes object name)
+custom bone naming strategy (currently it just takes object name)
 
 add utf-8 errors back in
 
