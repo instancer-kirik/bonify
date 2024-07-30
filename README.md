@@ -33,6 +33,8 @@ selection macros
 
 custom bone naming strategy (currently it just takes object name)
 
+decide bone direction
+
 add utf-8 errors back in
 
 
