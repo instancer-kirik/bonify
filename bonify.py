@@ -308,7 +308,7 @@ class OBJECT_OT_select_armature(bpy.types.Operator):
         return {'FINISHED'}
 
 class VIEW3D_PT_custom_panel(bpy.types.Panel):
-    bl_label = "Custom Tools"
+    bl_label = "bonify"
     bl_idname = "VIEW3D_PT_custom_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -336,7 +336,7 @@ class VIEW3D_PT_custom_panel(bpy.types.Panel):
         layout.operator("object.add_bone", text="Add Bone with Envelope Weights", icon='BONE_DATA').weight_method = 'ENVELOPE'
         layout.operator("object.add_bone", text="Add Bone with Automatic Weights", icon='BONE_DATA').weight_method = 'AUTO'
 
-        layout.label(text="Weight Painted Bones:")
+        layout.label(text="Bone Chain:")
         obj = context.object
         if obj and obj.type == 'MESH' and obj.vertex_groups:
             for vgroup in obj.vertex_groups:
