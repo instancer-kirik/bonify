@@ -1,17 +1,41 @@
 import bpy
+import mathutils
 from mathutils import Vector
+
+def calculate_bone_midpoint(bone):
+    """Calculate the midpoint of a given bone."""
+    head = bone.head
+    tail = bone.tail
+    midpoint = (head + tail) / 2
+    return midpoint
+
+def bone_length(bone):
+    """Calculate the length of a given bone."""
+    return (bone.head - bone.tail).length
+
+def is_point_in_bone_bounds(point, bone):
+    """Check if a point is within the bounds of a bone."""
+    head = bone.head
+    tail = bone.tail
+    bone_direction = tail - head
+    point_direction = point - head
+    projection = point_direction.project(bone_direction)
+    projected_point = head + projection
+    return (projected_point - head).length <= bone_length(bone)
 
 def go_to_pose_mode(context, armature):
     context.view_layer.objects.active = armature
     bpy.ops.object.mode_set(mode='POSE')
 
+def go_to_edit_mode(armature):
+    bpy.context.view_layer.objects.active = armature
+    bpy.ops.object.mode_set(mode='EDIT')
+
 def safe_string(s):
     try:
         return s.encode('utf-8').decode('utf-8')
     except UnicodeDecodeError as e:
-        # Log the error and the problematic string
         print(f"Encoding error: {e}, in string: {repr(s)}")
-        # Replace invalid characters with a safe character
         return ''.join([c if ord(c) < 128 else '?' for c in s])
 
 def get_bone_parenting_chain(bone):
@@ -20,6 +44,65 @@ def get_bone_parenting_chain(bone):
         chain.append(bone.name)
         bone = bone.parent
     return " -> ".join(reversed(chain))
+3
+def find_potential_parent(armature, child_bone, bones):
+    """Find a potential parent for a given bone."""
+    child_midpoint = calculate_bone_midpoint(child_bone)
+    potential_parents = [
+        bone for bone in bones 
+        if bone != child_bone and is_point_in_bone_bounds(child_midpoint, bone)
+    ]
+    if potential_parents:
+        return max(potential_parents, key=bone_length)
+    return None
+
+
+def parent_bones_algorithm(context, armature, objects, full_length=False):
+    bpy.context.view_layer.objects.active = armature
+    bpy.ops.object.mode_set(mode='EDIT')
+    # First, create all bones
+    new_bones = []
+    for obj in objects:
+        if obj.type != 'MESH':
+            continue
+        bone = add_bone_to_object(obj, armature, full_length)
+        if bone:
+            new_bones.append(bone)
+    # If no new bones were added, exit the function
+    if not new_bones:
+        bpy.ops.object.mode_set(mode='OBJECT')
+        return
+    
+    # Sort bones by their position along the Y-axis
+    sorted_bones = sorted(new_bones, key=lambda b: b.head.y)
+    # Parent bones by position
+    for child_bone in sorted_bones:
+        parent_bone = find_potential_parent(armature, child_bone, sorted_bones)
+        if parent_bone:
+            try:
+                child_bone.use_connect = False
+                child_bone.parent = parent_bone
+            except Exception as e:
+                print(f"Error parenting bone {child_bone.name} to {parent_bone.name}: {e}")
+    
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+def create_bone(armature, name, head, tail, roll=0):
+    """
+    Create a new bone in the given armature.
+    
+    :param armature: The armature object
+    :param name: Name of the new bone
+    :param head: Head position of the bone
+    :param tail: Tail position of the bone
+    :param roll: Roll of the bone
+    :return: The newly created bone
+    """
+    bone = armature.data.edit_bones.new(name)
+    bone.head = head
+    bone.tail = tail
+    bone.roll = roll
+    return bone
 
 def safe_report(operator, level, message):
     try:
@@ -28,287 +111,139 @@ def safe_report(operator, level, message):
         print(f"Encoding error in report message: {e}, message: {repr(message)}")
         operator.report({'ERROR'}, f"Encoding error in report message: {str(e)}")
 
+def is_wheel(obj):
+    if not bpy.context.scene.check_for_wheels:
+        return False
+    world_bbox = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+    dimensions = Vector((
+        max(v.x for v in world_bbox) - min(v.x for v in world_bbox),
+        max(v.y for v in world_bbox) - min(v.y for v in world_bbox),
+        max(v.z for v in world_bbox) - min(v.z for v in world_bbox)
+    ))
+    return abs(dimensions.x - dimensions.z) < 0.001 and dimensions.y < min(dimensions.x, dimensions.z)
+
+def add_bone_to_object(obj, armature, full_length=False):
+    try:
+        if obj is None or armature is None:
+            print("Invalid object or armature")
+            return None
+
+        bpy.context.view_layer.objects.active = armature
+        bpy.ops.object.mode_set(mode='EDIT')
+
+        world_bbox = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+        world_center = sum(world_bbox, Vector()) / 8
+        world_dims = Vector((
+            max(v.x for v in world_bbox) - min(v.x for v in world_bbox),
+            max(v.y for v in world_bbox) - min(v.y for v in world_bbox),
+            max(v.z for v in world_bbox) - min(v.z for v in world_bbox)
+        ))
+
+        obj_loc = armature.matrix_world.inverted() @ world_center
+
+        if is_wheel(obj):
+            bone_length = max(world_dims.x, world_dims.z)
+            bone_dir = Vector((0, 0, 1))  # Use Z-axis for wheels
+        else:
+            bone_length = world_dims.y
+            bone_dir = Vector((0, 1, 0))  # Use Y-axis for non-wheels
+
+        if full_length:
+            head = obj_loc - (bone_dir * bone_length / 2)
+            tail = obj_loc + (bone_dir * bone_length / 2)
+        else:
+            head = obj_loc
+            tail = obj_loc + (bone_dir * bone_length)
+
+        bone_name = obj.name
+        bone = create_bone(armature, bone_name, head, tail)
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        if not any(mod.type == 'ARMATURE' and mod.object == armature for mod in obj.modifiers):
+            armature_modifier = obj.modifiers.new(name="Armature", type='ARMATURE')
+            armature_modifier.object = armature
+
+        vertex_group = obj.vertex_groups.new(name=bone_name)
+        vertex_group.add(range(len(obj.data.vertices)), 1.0, 'REPLACE')
+
+        return bone
+    except Exception as e:
+        print(f"Error in add_bone_to_object: {e}")
+        if bpy.context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        return None
+
+
+
 class OBJECT_OT_add_bone(bpy.types.Operator):
     bl_idname = "object.add_bone"
     bl_label = "Add Bone"
     bl_description = "Add a bone at the selected object's origin and set up weights"
-
-    weight_method: bpy.props.EnumProperty(
-        name="Weight Method",
-        description="Choose the method for weight assignment",
-        items=[
-            ('ENVELOPE', "Envelope Weights", "Assign weights using envelope method"),
-            ('AUTO', "Automatic Weights", "Assign weights automatically")
-        ],
-        default='AUTO'
-    )
-
-    def get_closest_bone_on_axes(self, context, armature, location_local, ignore_bone_name=None):
-        closest_bone = None
-        closest_distance = float('inf')
-
-        safe_report(self, {'INFO'}, f"Searching for closest bone to location: {location_local}")
-        safe_report(self, {'INFO'}, f"Selected axes: {context.scene.selected_axes}")
-
-        # Create a direction vector based on selected axes
-        direction = Vector((
-            1 if 'X' in context.scene.selected_axes else (-1 if '-X' in context.scene.selected_axes else 0),
-            1 if 'Y' in context.scene.selected_axes else (-1 if '-Y' in context.scene.selected_axes else 0),
-            1 if 'Z' in context.scene.selected_axes else (-1 if '-Z' in context.scene.selected_axes else 0)
-        ))
-
-        if direction.length == 0:
-            safe_report(self, {'WARNING'}, "No axes selected for search direction")
-            return None
-
-        direction.normalize()
-
-        for bone in armature.data.edit_bones:
-            if bone.name == ignore_bone_name:
-                continue  # Skip the bone we want to ignore
-
-            # Calculate the midpoint of the bone
-            bone_midpoint = (bone.head + bone.tail) / 2
-
-            # Calculate the vector from the location to the bone midpoint
-            to_bone = bone_midpoint - location_local
-
-            # Project the vector onto our search direction
-            projection_length = to_bone.dot(direction)
-
-            # Check if the projection is in the positive direction of our search
-            if projection_length > 0:
-                # Calculate the distance from the location to the projection point
-                projection_point = location_local + direction * projection_length
-                distance = (projection_point - bone_midpoint).length
-
-                safe_report(self, {'INFO'}, f"Bone: {safe_string(bone.name)}, Distance: {distance}")
-
-                if distance < closest_distance:
-                    closest_distance = distance
-                    closest_bone = bone
-
-        if closest_bone:
-            safe_report(self, {'INFO'}, f"Closest bone found: {safe_string(closest_bone.name)}")
-        else:
-            safe_report(self, {'WARNING'}, "No closest bone found")
-
-        return closest_bone
+    bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         try:
             obj = context.object
             armature = context.scene.selected_armature
             go_to_pose_mode_flag = context.scene.go_to_pose_mode
+            full_length = context.scene.full_length_bone
+            weight_method = context.scene.weight_method
 
             if obj and armature and obj != armature:
                 if obj.name not in context.scene.objects:
-                    safe_report(self, {'WARNING'}, "Selected object is no longer valid.")
+                    self.report({'WARNING'}, "Selected object is no longer valid.")
                     return {'CANCELLED'}
 
-                original_active = context.view_layer.objects.active
-                original_selected = context.selected_objects.copy()
-                original_mode = context.mode
+                add_bone_to_object(obj, armature, full_length)
 
-                try:
-                    safe_report(self, {'INFO'}, "Setting origin to geometry")
-                    # Set origin to geometry
-                    bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
+                if weight_method == 'ENVELOPE':
+                    bpy.ops.object.parent_set(type='ARMATURE_ENVELOPE')
+                elif weight_method == 'AUTO':
+                    bpy.ops.object.parent_set(type='ARMATURE_AUTO')
 
-                    # Get the location of the object (geometry origin)
-                    location_world = obj.matrix_world.translation
-                    safe_report(self, {'INFO'}, f"Object location in world space: {location_world}")
+                if go_to_pose_mode_flag:
+                    bpy.ops.object.mode_set(mode='POSE')
 
-                    context.view_layer.objects.active = armature
-
-                    if armature.name not in context.scene.objects:
-                        safe_report(self, {'WARNING'}, "Selected armature is no longer valid.")
-                        return {'CANCELLED'}
-
-                    # Convert the location to the armature's local space
-                    location_local = armature.matrix_world.inverted() @ location_world
-                    safe_report(self, {'INFO'}, f"Object location in local space: {location_local}")
-
-                    # Enter edit mode on the armature
-                    bpy.ops.object.mode_set(mode='EDIT')
-                    
-                    # Add a new bone at the object's location
-                    new_bone_name = safe_string(obj.name)
-                    safe_report(self, {'INFO'}, f"Creating new bone with name: {new_bone_name}")
-                    new_bone = armature.data.edit_bones.new(new_bone_name)
-                    new_bone.head = location_local
-
-                    # Calculate bone size based on object dimensions
-                    obj_size = max(obj.dimensions)
-                    bone_length = max(obj_size * 0.5, 0.5)  # At least 0.5 units long
-
-                    # Set bone tail to create a larger bone
-                    new_bone.tail = location_local + Vector((0, 0, bone_length))
-
-                    # Set envelope properties for the new bone
-                    new_bone.envelope_distance = bone_length * 0.5
-                    new_bone.envelope_weight = 1.0
-
-                    if context.scene.selected_parent_bone:
-                        parent_bone_name = safe_string(context.scene.selected_parent_bone)
-                        safe_report(self, {'INFO'}, f"Finding parent bone: {parent_bone_name}")
-                        parent_bone = armature.data.edit_bones.get(parent_bone_name)
-                        if not parent_bone:
-                            safe_report(self, {'WARNING'}, f"Selected parent bone '{parent_bone_name}' not found.")
-                            bpy.ops.object.mode_set(mode='OBJECT')
-                            return {'CANCELLED'}
-                    else:
-                        # Find the closest bone to parent the new bone to
-                        parent_bone = self.get_closest_bone_on_axes(context, armature, location_local, ignore_bone_name=new_bone_name)
-                        if not parent_bone:
-                            safe_report(self, {'WARNING'}, "No suitable parent bone found.")
-                            bpy.ops.object.mode_set(mode='OBJECT')
-                            return {'CANCELLED'}
-                    # Parent the new bone to the selected parent bone
-                    new_bone.parent = parent_bone
-
-                    safe_report(self, {'INFO'}, f"New bone added: {new_bone_name}")
-
-                    # Exit edit mode
-                    bpy.ops.object.mode_set(mode='OBJECT')
-
-                    # Add armature modifier if it doesn't exist
-                    found_existing_armature = False
-                    for modifier in obj.modifiers:
-                        modifier_name = safe_string(modifier.name)
-                        safe_report(self, {'INFO'}, f"Existing modifier: {modifier_name}")
-                        if modifier_name == "Armature":
-                            found_existing_armature = True
-                            if modifier.object != armature:
-                                safe_report(self, {'WARNING'}, f"Existing armature modifier is linked to a different armature: {safe_string(modifier.object.name)}")
-                            else:
-                                safe_report(self, {'INFO'}, f"Using existing armature modifier linked to: {safe_string(modifier.object.name)}")
-                            break
-
-                    if not found_existing_armature:
-                        safe_report(self, {'INFO'}, "Adding new armature modifier")
-                        armature_modifier = obj.modifiers.new(name="Armature", type='ARMATURE')
-                        armature_modifier.object = armature
-
-                    safe_report(self, {'INFO'}, "aaaaa")
-                    # Ensure the selected part is assigned to the new bone
-                    vertex_group_name = safe_string(new_bone_name)
-                    safe_report(self, {'INFO'}, "bbbbb")
-                    safe_report(self, {'INFO'}, f"Vertex group name: {vertex_group_name}")
-
-                    if obj.vertex_groups.get(vertex_group_name) is None:
-                        safe_report(self, {'INFO'}, "Creating new vertex group")
-                        vertex_group = obj.vertex_groups.new(name=vertex_group_name)
-                    else:
-                        safe_report(self, {'INFO'}, "Using existing vertex group")
-                        vertex_group = obj.vertex_groups.get(vertex_group_name)
-
-                    context.view_layer.objects.active = obj
-                    bpy.ops.object.mode_set(mode='EDIT')
-                    bpy.ops.mesh.select_all(action='SELECT')
-                    obj.vertex_groups.active = vertex_group
-                    bpy.ops.object.vertex_group_assign()
-                    bpy.ops.mesh.select_all(action='DESELECT')
-                    bpy.ops.object.mode_set(mode='OBJECT')
-
-                    # Parent the object to the armature with the selected weight method
-                    context.view_layer.objects.active = obj
-                    armature.select_set(False)
-                    obj.select_set(True)
-
-                    if self.weight_method == 'ENVELOPE':
-                        bpy.ops.object.parent_set(type='ARMATURE_ENVELOPE')
-                    elif self.weight_method == 'AUTO':
-                        bpy.ops.object.parent_set(type='ARMATURE_AUTO')
-
-                    # Ensure the new bone is influencing the object
-                    bpy.ops.object.mode_set(mode='WEIGHT_PAINT')
-                    bpy.ops.object.mode_set(mode='OBJECT')
-
-                    # Optionally go to pose mode
-                    if go_to_pose_mode_flag:
-                        go_to_pose_mode(context, armature)
-                    else:
-                        # Restore original active object and selection
-                        context.view_layer.objects.active = original_active
-                        bpy.ops.object.select_all(action='DESELECT')
-                        for ob in original_selected:
-                            ob.select_set(True)
-
-                        # Restore original mode
-                        if original_mode != 'OBJECT':
-                            bpy.ops.object.mode_set(mode=original_mode)
-
-                    safe_report(self, {'INFO'}, f"Bone added, parented, and weights assigned using {self.weight_method} method.")
-                    return {'FINISHED'}
-
-                except UnicodeDecodeError as e:
-                    safe_report(self, {'ERROR'}, f"Encoding error: {str(e)}")
-                    return {'CANCELLED'}
-                except Exception as e:
-                    safe_report(self, {'ERROR'}, f"An error occurred: {str(e)}")
-                    return {'CANCELLED'}
+                self.report({'INFO'}, f"Bone added, parented, and weights assigned using {weight_method} method.")
+                return {'FINISHED'}
 
             else:
-                safe_report(self, {'WARNING'}, "No object or armature selected, or object is the same as armature.")
+                self.report({'WARNING'}, "No object or armature selected, or object is the same as armature.")
                 return {'CANCELLED'}
 
-        except UnicodeDecodeError as e:
-            safe_report(self, {'ERROR'}, f"Encoding error: {str(e)}")
+        except Exception as e:
+            self.report({'ERROR'}, f"Error in add_bone_to_object: {str(e)}")
             return {'CANCELLED'}
 
-class OBJECT_OT_select_parent_bone(bpy.types.Operator):
-    bl_idname = "object.select_parent_bone"
-    bl_label = "Select Parent Bone"
-    bl_description = "Manually select the parent bone for the new bone"
+class OBJECT_OT_generate_rig(bpy.types.Operator):
+    bl_idname = "object.generate_rig"
+    bl_label = "Generate Rig"
+    bl_description = "Generate rig with custom parenting algorithm"
 
     def execute(self, context):
         armature = context.scene.selected_armature
-        if armature and armature.type == 'ARMATURE':
-            if context.mode != 'EDIT_ARMATURE':
-                bpy.ops.object.mode_set(mode='EDIT')
-            active_bone = armature.data.edit_bones.active
-            if active_bone:
-                context.scene.selected_parent_bone = safe_string(active_bone.name)
-                # Clear axes selection
-                context.scene.selected_axes = set()
-                safe_report(self, {'INFO'}, f"Selected parent bone: {safe_string(active_bone.name)}")
-            else:
-                safe_report(self, {'WARNING'}, "No active bone selected")
-            if context.mode != 'OBJECT':
-                bpy.ops.object.mode_set(mode='OBJECT')
-        else:
-            safe_report(self, {'WARNING'}, "No armature selected or invalid armature")
-        return {'FINISHED'}
+        full_length = context.scene.full_length_bone
+        if not armature:
+            self.report({'WARNING'}, "No armature selected")
+            return {'CANCELLED'}
 
-class OBJECT_OT_clear_selected_parent_bone(bpy.types.Operator):
-    bl_idname = "object.clear_selected_parent_bone"
-    bl_label = "Clear Parent Bone"
-    bl_description = "Clear the manually selected parent bone"
+        objects = context.selected_objects
+        if not objects:
+            self.report({'WARNING'}, "No objects selected")
+            return {'CANCELLED'}
 
-    def execute(self, context):
-        context.scene.selected_parent_bone = ""
-        safe_report(self, {'INFO'}, "Cleared selected parent bone")
-        return {'FINISHED'}
+        try:
+            parent_bones_algorithm(context, armature, objects, full_length)
+        except Exception as e:
+            self.report({'ERROR'}, f"Error during rig generation: {str(e)}")
+            return {'CANCELLED'}
 
-class OBJECT_OT_select_armature(bpy.types.Operator):
-    bl_idname = "object.select_armature"
-    bl_label = "Select Armature"
-    bl_description = "Select an armature for adding bones"
-
-    armature_name: bpy.props.StringProperty()
-
-    def execute(self, context):
-        armature = bpy.data.objects.get(self.armature_name)
-        if armature and armature.type == 'ARMATURE':
-            context.scene.selected_armature = armature
-            safe_report(self, {'INFO'}, f"Selected armature: {safe_string(armature.name)}")
-        else:
-            safe_report(self, {'WARNING'}, "Armature not found or invalid")
+        self.report({'INFO'}, "Rig generated successfully")
         return {'FINISHED'}
 
 class VIEW3D_PT_custom_panel(bpy.types.Panel):
-    bl_label = "bonify"
+    bl_label = "Bonify"
     bl_idname = "VIEW3D_PT_custom_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -333,29 +268,110 @@ class VIEW3D_PT_custom_panel(bpy.types.Panel):
 
         layout.prop(context.scene, "go_to_pose_mode", text="Go to Pose Mode After Adding Bone")
 
-        layout.operator("object.add_bone", text="Add Bone with Envelope Weights", icon='BONE_DATA').weight_method = 'ENVELOPE'
-        layout.operator("object.add_bone", text="Add Bone with Automatic Weights", icon='BONE_DATA').weight_method = 'AUTO'
+        layout.prop(context.scene, "full_length_bone", text="Full Length Bone")
+        layout.prop(context.scene, "check_for_wheels", text="Check for Wheels")
+        layout.prop(context.scene, "weight_method", text="Weight Method")
+        layout.prop(context.scene, "main_chain_cutoff", text="Main Chain Cutoff (%)")
+        layout.operator("object.add_bone", text="Add Bone", icon='BONE_DATA')
+
+        layout.operator("object.generate_rig", text="Generate Rig")
+
+        layout.operator("object.clear_all_bones_except_root", text="Clear All Bones Except Root", icon='BONE_DATA')
 
         layout.label(text="Bone Chain:")
         obj = context.object
         if obj and obj.type == 'MESH' and obj.vertex_groups:
-            for vgroup in obj.vertex_groups:
-                bone_name = vgroup.name
-                if context.scene.selected_armature and bone_name in context.scene.selected_armature.data.bones:
-                    bone = context.scene.selected_armature.data.bones[bone_name]
-                    try:
-                        layout.label(text=f"{safe_string(bone_name)}: {get_bone_parenting_chain(bone)}")
-                    except UnicodeDecodeError as e:
-                        print(f"Encoding error: {e}, in bone name: {repr(bone_name)}")
-                        layout.label(text="Invalid character in bone name")
+            armature = context.scene.selected_armature
+            if armature:
+                for vgroup in obj.vertex_groups:
+                    bone_name = vgroup.name
+                    if bone_name in armature.data.bones:
+                        bone = armature.data.bones[bone_name]
+                        chain = get_bone_parenting_chain(bone)
+                        layout.label(text=f"{bone_name}: {chain}")
         else:
             layout.label(text="No weight painted bones found")
 
+class OBJECT_OT_select_armature(bpy.types.Operator):
+    bl_idname = "object.select_armature"
+    bl_label = "Select Armature"
+    bl_description = "Select an armature for adding bones"
+
+    armature_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        armature = bpy.data.objects.get(self.armature_name)
+        if armature and armature.type == 'ARMATURE':
+            context.scene.selected_armature = armature
+            safe_report(self, {'INFO'}, f"Selected armature: {safe_string(armature.name)}")
+        else:
+            safe_report(self, {'WARNING'}, "Armature not found or invalid")
+        return {'FINISHED'}
+
+class OBJECT_OT_select_parent_bone(bpy.types.Operator):
+    bl_idname = "object.select_parent_bone"
+    bl_label = "Select Parent Bone"
+    bl_description = "Manually select the parent bone for the new bone"
+
+    def execute(self, context):
+        armature = context.scene.selected_armature
+        if armature and armature.type == 'ARMATURE':
+            if bpy.context.mode != 'EDIT_ARMATURE':
+                bpy.ops.object.mode_set(mode='EDIT')
+            active_bone = armature.data.edit_bones.active
+            if active_bone:
+                context.scene.selected_parent_bone = safe_string(active_bone.name)
+                context.scene.selected_axes = set()
+                safe_report(self, {'INFO'}, f"Selected parent bone: {safe_string(active_bone.name)}")
+            else:
+                safe_report(self, {'WARNING'}, "No active bone selected")
+            if bpy.context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+        else:
+            safe_report(self, {'WARNING'}, "No armature selected or invalid armature")
+        return {'FINISHED'}
+
+class OBJECT_OT_clear_selected_parent_bone(bpy.types.Operator):
+    bl_idname = "object.clear_selected_parent_bone"
+    bl_label = "Clear Parent Bone"
+    bl_description = "Clear the manually selected parent bone"
+
+    def execute(self, context):
+        context.scene.selected_parent_bone = ""
+        safe_report(self, {'INFO'}, "Cleared selected parent bone")
+        return {'FINISHED'}
+
+class OBJECT_OT_clear_all_bones_except_root(bpy.types.Operator):
+    bl_idname = "object.clear_all_bones_except_root"
+    bl_label = "Clear All Bones Except Root"
+    bl_description = "Clear all bones from the selected armature except the root bone"
+
+    def execute(self, context):
+        armature = context.scene.selected_armature
+        if armature and armature.type == 'ARMATURE':
+            bpy.context.view_layer.objects.active = armature
+            if bpy.context.mode != 'EDIT_ARMATURE':
+                bpy.ops.object.mode_set(mode='EDIT')
+            root_bone = next((bone for bone in armature.data.edit_bones if not bone.parent), None)
+            if root_bone:
+                bones_to_remove = [bone for bone in armature.data.edit_bones if bone != root_bone]
+                for bone in bones_to_remove:
+                    armature.data.edit_bones.remove(bone)
+            if bpy.context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            self.report({'INFO'}, "All bones except the root have been cleared.")
+            return {'FINISHED'}
+        else:
+            self.report({'WARNING'}, "No valid armature selected.")
+            return {'CANCELLED'}
+
 def register():
     bpy.utils.register_class(OBJECT_OT_add_bone)
+    bpy.utils.register_class(OBJECT_OT_generate_rig)
     bpy.utils.register_class(OBJECT_OT_select_armature)
     bpy.utils.register_class(OBJECT_OT_select_parent_bone)
     bpy.utils.register_class(OBJECT_OT_clear_selected_parent_bone)
+    bpy.utils.register_class(OBJECT_OT_clear_all_bones_except_root)
     bpy.utils.register_class(VIEW3D_PT_custom_panel)
     bpy.types.Scene.selected_armature = bpy.props.PointerProperty(type=bpy.types.Object)
     bpy.types.Scene.selected_axes = bpy.props.EnumProperty(
@@ -381,17 +397,50 @@ def register():
         name="Selected Parent Bone",
         description="Name of the manually selected parent bone"
     )
+    bpy.types.Scene.full_length_bone = bpy.props.BoolProperty(
+        name="Full Length Bone",
+        description="Toggle to create full-length bones from bottom to top of object",
+        default=False
+    )
+    bpy.types.Scene.check_for_wheels = bpy.props.BoolProperty(
+        name="Check for Wheels",
+        description="Toggle to check if objects are wheels based on their dimensions",
+        default=True
+    )
+    bpy.types.Scene.weight_method = bpy.props.EnumProperty(
+        name="Weight Method",
+        description="Choose the method for weight assignment",
+        items=[
+            ('ENVELOPE', "Envelope Weights", "Assign weights using envelope method"),
+            ('AUTO', "Automatic Weights", "Assign weights automatically")
+        ],
+        default='AUTO'
+    )
+    bpy.types.Scene.main_chain_cutoff = bpy.props.FloatProperty(
+        name="Main Chain Cutoff",
+        description="Percentage of the largest bone's length to be considered as main chain",
+        default=36.0,
+        min=0.0,
+        max=100.0,
+        subtype='PERCENTAGE'
+    )
 
 def unregister():
     bpy.utils.unregister_class(OBJECT_OT_add_bone)
+    bpy.utils.unregister_class(OBJECT_OT_generate_rig)
     bpy.utils.unregister_class(OBJECT_OT_select_armature)
     bpy.utils.unregister_class(OBJECT_OT_select_parent_bone)
     bpy.utils.unregister_class(OBJECT_OT_clear_selected_parent_bone)
+    bpy.utils.unregister_class(OBJECT_OT_clear_all_bones_except_root)
     bpy.utils.unregister_class(VIEW3D_PT_custom_panel)
     del bpy.types.Scene.selected_armature
     del bpy.types.Scene.selected_axes
     del bpy.types.Scene.go_to_pose_mode
     del bpy.types.Scene.selected_parent_bone
+    del bpy.types.Scene.full_length_bone
+    del bpy.types.Scene.check_for_wheels
+    del bpy.types.Scene.weight_method
+    del bpy.types.Scene.main_chain_cutoff
 
 if __name__ == "__main__":
     register()
