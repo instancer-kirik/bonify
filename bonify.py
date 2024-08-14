@@ -23,6 +23,27 @@ def is_point_in_bone_bounds(point, bone):
     projected_point = head + projection
     return (projected_point - head).length <= bone_length(bone)
 
+def calculate_bone_midpoint(bone):
+    """Calculate the midpoint of a given bone."""
+    head = bone.head
+    tail = bone.tail
+    midpoint = (head + tail) / 2
+    return midpoint
+
+def bone_length(bone):
+    """Calculate the length of a given bone."""
+    return (bone.head - bone.tail).length
+
+def is_point_in_bone_bounds(point, bone):
+    """Check if a point is within the bounds of a bone."""
+    head = bone.head
+    tail = bone.tail
+    bone_direction = tail - head
+    point_direction = point - head
+    projection = point_direction.project(bone_direction)
+    projected_point = head + projection
+    return (projected_point - head).length <= bone_length(bone)
+
 def go_to_pose_mode(context, armature):
     context.view_layer.objects.active = armature
     bpy.ops.object.mode_set(mode='POSE')
@@ -94,6 +115,24 @@ def get_bone_parenting_chain(bone):
         chain.append(bone.name)
         bone = bone.parent
     return " -> ".join(reversed(chain))
+
+
+def create_bone(armature, name, head, tail, roll=0):
+    """
+    Create a new bone in the given armature.
+    
+    :param armature: The armature object
+    :param name: Name of the new bone
+    :param head: Head position of the bone
+    :param tail: Tail position of the bone
+    :param roll: Roll of the bone
+    :return: The newly created bone
+    """
+    bone = armature.data.edit_bones.new(name)
+    bone.head = head
+    bone.tail = tail
+    bone.roll = roll
+    return bone
 
 def find_potential_parent(armature, child_bone, bones):
     """Find a potential parent for a given bone."""
@@ -351,6 +390,24 @@ class OBJECT_OT_generate_rig(bpy.types.Operator):
         self.report({'INFO'}, "Rig generated successfully")
         return {'FINISHED'}
 
+        full_length = context.scene.full_length_bone
+        if not armature:
+            self.report({'WARNING'}, "No armature selected")
+            return {'CANCELLED'}
+
+        objects = context.selected_objects
+        if not objects:
+            self.report({'WARNING'}, "No objects selected")
+            return {'CANCELLED'}
+
+        try:
+            parent_bones_algorithm(context, armature, objects, full_length)
+        except Exception as e:
+            self.report({'ERROR'}, f"Error during rig generation: {str(e)}")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, "Rig generated successfully")
+        return {'FINISHED'}
 
 class VIEW3D_PT_custom_panel(bpy.types.Panel):
     bl_label = "Bonify"
