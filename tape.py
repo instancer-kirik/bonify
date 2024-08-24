@@ -1,46 +1,48 @@
 import bpy
 import bmesh
 import math
-from mathutils import Vector, Matrix
+from mathutils import Vector
 
-def create_segmented_plane(bone_count, bone_locations, width):
-    # Create a new mesh for the plane
+def create_segmented_plane(bone_locations, width):
+    """Create a segmented plane with edges at bone head locations, aligned along the X-axis."""
     mesh = bpy.data.meshes.new("Train_Path")
     plane = bpy.data.objects.new("Train_Path", mesh)
     bpy.context.collection.objects.link(plane)
     
     bm = bmesh.new()
+    half_width = width / 2
     
-    for location in bone_locations:
-        half_width = width / 2
-        # Create vertices on either side of the bone head location along the Y axis (since bones are vertical)
-        v1 = bm.verts.new(location + Vector((-half_width, 0, 0)))  # Left vertex
-        v2 = bm.verts.new(location + Vector((half_width, 0, 0)))   # Right vertex
+    for i, location in enumerate(bone_locations):
+        # Calculate the vertices for the plane segment at each bone's head
+        v1 = bm.verts.new(location + Vector((-half_width, 0, 0)))
+        v2 = bm.verts.new(location + Vector((half_width, 0, 0)))
         bm.verts.ensure_lookup_table()
         
-        # Create an edge between the current pair of vertices
         bm.edges.new((v1, v2))
-    
-    # Create edges between the pairs of vertices to form a continuous path
-    for i in range(bone_count - 1):
-        bm.edges.new((bm.verts[i*2], bm.verts[(i+1)*2]))       # Connect left vertices
-        bm.edges.new((bm.verts[i*2+1], bm.verts[(i+1)*2+1]))   # Connect right vertices
-    
-    # Create faces
-    for i in range(bone_count - 1):
-        bm.faces.new((bm.verts[i*2], bm.verts[i*2+1], bm.verts[(i+1)*2+1], bm.verts[(i+1)*2]))
+        
+        if i > 0:
+            bm.faces.new((bm.verts[-4], bm.verts[-3], bm.verts[-1], bm.verts[-2]))
     
     bm.to_mesh(mesh)
     bm.free()
     
-    # Create vertex groups based on sorted bone locations
-    for i, _ in enumerate(bone_locations):
+    # Create vertex groups for each segment
+    for i in range(len(bone_locations)):
         vg = plane.vertex_groups.new(name=f"Bone_{i+1}")
         vg.add([i*2, i*2+1], 1.0, 'REPLACE')
     
     return plane
 
-def setup_bone_constraints(armature, plane, loc_axis, loc_inverse, rot_axis, rot_inverse, loc_offset, influence):
+def setup_follow_curve_constraint(plane, curve):
+    """Apply the follow curve constraint to the segmented plane."""
+    follow_curve = plane.constraints.new(type='FOLLOW_PATH')
+    follow_curve.target = curve
+    follow_curve.use_fixed_location = True
+    follow_curve.forward_axis = 'FORWARD_Y'
+    follow_curve.up_axis = 'UP_Z'
+
+def setup_bone_constraints(armature, plane, loc_axis, loc_inverse, rot_axis, rot_inverse, influence):
+    """Set up constraints to make bones follow the segmented plane."""
     sorted_bones = sorted(
         (bone for bone in armature.pose.bones if bone.bone.select),
         key=lambda b: (armature.matrix_world @ b.head).y
@@ -54,8 +56,8 @@ def setup_bone_constraints(armature, plane, loc_axis, loc_inverse, rot_axis, rot
         # Copy Location constraint
         loc_constraint = bone.constraints.new('COPY_LOCATION')
         loc_constraint.target = plane
-        loc_constraint.subtarget = f"Bone_{i+1}"
-        loc_constraint.use_offset = loc_offset
+        loc_constraint.subtarget = f"Bone_{i + 1}"
+        loc_constraint.use_offset = True
         loc_constraint.target_space = 'WORLD'
         loc_constraint.owner_space = 'WORLD'
         
@@ -66,15 +68,12 @@ def setup_bone_constraints(armature, plane, loc_axis, loc_inverse, rot_axis, rot
         loc_constraint.invert_y = 'Y' in loc_inverse
         loc_constraint.invert_z = 'Z' in loc_inverse
         loc_constraint.influence = influence
-        loc_constraint.mute = False
-        loc_constraint.show_expanded = True
-        loc_constraint.name = f"Copy Loc {i+1}"
         
         # Copy Rotation constraint
         rot_constraint = bone.constraints.new('COPY_ROTATION')
         rot_constraint.target = plane
-        rot_constraint.subtarget = f"Bone_{i+1}"
-        rot_constraint.use_offset = loc_offset
+        rot_constraint.subtarget = f"Bone_{i + 1}"
+        rot_constraint.use_offset = True
         rot_constraint.target_space = 'WORLD'
         rot_constraint.owner_space = 'WORLD'
         
@@ -85,65 +84,6 @@ def setup_bone_constraints(armature, plane, loc_axis, loc_inverse, rot_axis, rot
         rot_constraint.invert_y = 'Y' in rot_inverse
         rot_constraint.invert_z = 'Z' in rot_inverse
         rot_constraint.influence = influence
-        rot_constraint.mute = False
-        rot_constraint.show_expanded = True
-        rot_constraint.name = f"Copy Rot {i+1}"
-
-def rotate_bones_to_path(armature):
-    bones = [bone for bone in armature.pose.bones if bone.bone.select]
-    
-    if len(bones) < 2:
-        return  # Need at least two bones to determine direction
-
-    for i in range(len(bones) - 1):
-        current_bone = bones[i]
-        next_bone = bones[i + 1]
-        
-        # Calculate direction vector between current and next bone
-        direction = next_bone.head - current_bone.head
-        direction.normalize()
-        
-        # Calculate rotation from vertical (Z-axis) to new direction
-        axis = Vector((0, 0, 1)).cross(direction)
-        angle = math.acos(Vector((0, 0, 1)).dot(direction))
-        
-        # Create rotation matrix
-        rotation_matrix = Matrix.Rotation(angle, 4, axis)
-        
-        # Apply rotation to the bone
-        current_bone.matrix_basis = rotation_matrix @ current_bone.matrix_basis
-
-    # Rotate the last bone to match the direction of the previous bone
-    if len(bones) > 1:
-        last_bone = bones[-1]
-        last_direction = last_bone.head - bones[-2].head
-        last_direction.normalize()
-        
-        axis = Vector((0, 0, 1)).cross(last_direction)
-        angle = math.acos(Vector((0, 0, 1)).dot(last_direction))
-        
-        rotation_matrix = Matrix.Rotation(angle, 4, axis)
-        last_bone.matrix_basis = rotation_matrix @ last_bone.matrix_basis
-
-    # Update the armature
-    armature.data.update_tag()
-    bpy.context.view_layer.update()
-
-class RotateBonesOperator(bpy.types.Operator):
-    bl_idname = "object.rotate_bones"
-    bl_label = "Rotate Bones"
-    bl_options = {'REGISTER', 'UNDO'}
-    
-    def execute(self, context):
-        armature = context.active_object
-        if armature.type != 'ARMATURE':
-            self.report({'ERROR'}, "Active object must be an armature")
-            return {'CANCELLED'}
-        
-        # Rotate bones to proper orientation
-        rotate_bones_to_path(armature)
-        
-        return {'FINISHED'}
 
 class AddTrainPathOperator(bpy.types.Operator):
     bl_idname = "object.add_train_path"
@@ -156,20 +96,31 @@ class AddTrainPathOperator(bpy.types.Operator):
             self.report({'ERROR'}, "Active object must be an armature")
             return {'CANCELLED'}
         
-        bone_count = len([b for b in armature.data.bones if b.select])
-        if bone_count < 2:
+        curve = next((obj for obj in bpy.data.objects if obj.type == 'CURVE'), None)
+        if not curve:
+            self.report({'ERROR'}, "No curve found in the scene")
+            return {'CANCELLED'}
+        
+        selected_bones = [b for b in armature.data.bones if b.select]
+        if len(selected_bones) < 2:
             self.report({'ERROR'}, "At least two bones must be selected")
             return {'CANCELLED'}
         
-        # Rotate bones to proper orientation
-        rotate_bones_to_path(armature)
+        armature_matrix = armature.matrix_world
+        bone_locations = [armature_matrix @ bone.head_local for bone in selected_bones]
         
-        # Get bone head locations and sort by Y axis
-        bone_locations = sorted((bone.head for bone in armature.pose.bones if bone.bone.select), key=lambda v: v.y)
-        
-        plane = create_segmented_plane(bone_count, bone_locations, 1)
+        plane = create_segmented_plane(bone_locations, 1)
+        setup_follow_curve_constraint(plane, curve)
         props = context.scene.train_anim_properties
-        setup_bone_constraints(armature, plane, props.loc_axis, props.loc_inverse, props.rot_axis, props.rot_inverse, props.loc_offset, props.influence)
+        setup_bone_constraints(
+            armature, 
+            plane, 
+            props.loc_axis, 
+            props.loc_inverse, 
+            props.rot_axis, 
+            props.rot_inverse,
+            props.influence
+        )
         
         return {'FINISHED'}
 
@@ -190,7 +141,46 @@ class ClearConstraintsOperator(bpy.types.Operator):
         
         return {'FINISHED'}
 
+class UpdateConstraintsOperator(bpy.types.Operator):
+    """Update the constraints for the train animation."""
+    bl_idname = "object.update_train_constraints"
+    bl_label = "Update Train Constraints"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        armature = context.active_object
+        if armature.type != 'ARMATURE':
+            self.report({'ERROR'}, "Active object must be an armature")
+            return {'CANCELLED'}
+        
+        plane = bpy.data.objects.get("Train_Path")
+        if not plane:
+            self.report({'ERROR'}, "Train_Path object not found")
+            return {'CANCELLED'}
+        
+        # Get bone head locations and sort by Y axis
+        armature_matrix = armature.matrix_world
+        bone_locations = sorted(
+            (armature_matrix @ bone.head for bone in armature.pose.bones if bone.bone.select),
+            key=lambda v: v.y
+        )
+        
+        # Update constraints with the panel properties
+        props = context.scene.train_anim_properties
+        setup_bone_constraints(
+            armature, 
+            plane, 
+            props.loc_axis, 
+            props.loc_inverse, 
+            props.rot_axis, 
+            props.rot_inverse,
+            props.influence
+        )
+        
+        return {'FINISHED'}
+
 class TrainAnimationProperties(bpy.types.PropertyGroup):
+    """Properties for train animation settings."""
     loc_axis: bpy.props.EnumProperty(
         items=[('X', 'X', 'X Axis'),
                ('Y', 'Y', 'Y Axis'),
@@ -240,24 +230,18 @@ class TrainAnimationProperties(bpy.types.PropertyGroup):
         name="Rotation Inverse",
         default='NONE'
     )
-
-    loc_offset: bpy.props.BoolProperty(
-        name="Location Offset",
-        description="Use offset for location constraints",
-        default=False
-    )
-
+    
     influence: bpy.props.FloatProperty(
-        name="Influence",
-        description="Influence of the constraint",
+        name="Constraint Influence",
         default=1.0,
         min=0.0,
         max=1.0
     )
 
 class TrainAnimationPanel(bpy.types.Panel):
-    bl_label = "Train Animation"
-    bl_idname = "OBJECT_PT_train_animation"
+    """Panel for train animation controls."""
+    bl_label = "AAAAAAAAAAA"
+    bl_idname = "VIEW3D_PT_train_animation"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'Tool'
@@ -273,65 +257,30 @@ class TrainAnimationPanel(bpy.types.Panel):
         layout.prop(props, "influence")
         layout.operator(AddTrainPathOperator.bl_idname)
         layout.operator(ClearConstraintsOperator.bl_idname)
-        layout.operator(RotateBonesOperator.bl_idname)
+        #layout.operator(RotateBonesOperator.bl_idname)
         
         if context.active_object and context.active_object.type == 'ARMATURE':
             layout.operator(UpdateConstraintsOperator.bl_idname)
 
-class UpdateConstraintsOperator(bpy.types.Operator):
-    bl_idname = "object.update_train_constraints"
-    bl_label = "Update Train Constraints"
-    bl_options = {'REGISTER', 'UNDO'}
-    
-    def execute(self, context):
-        armature = context.active_object
-        if armature.type != 'ARMATURE':
-            self.report({'ERROR'}, "Active object must be an armature")
-            return {'CANCELLED'}
-        
-        plane = bpy.data.objects.get("Train_Path")
-        if not plane:
-            self.report({'ERROR'}, "Train_Path object not found")
-            return {'CANCELLED'}
-        
-        # Get bone head locations and sort by Y axis
-        armature_matrix = armature.matrix_world
-        bone_locations = sorted(
-            (armature_matrix @ bone.head for bone in armature.pose.bones if bone.bone.select),
-            key=lambda v: v.y
-        )
-        
-        # Update constraints with the panel properties
-        props = context.scene.train_anim_properties
-        setup_bone_constraints(
-            armature, 
-            plane, 
-            props.loc_axis, 
-            props.loc_inverse, 
-            props.rot_axis, 
-            props.rot_inverse,
-            props.loc_offset,
-            props.influence
-        )
-        
-        return {'FINISHED'}
 
 def register():
     bpy.utils.register_class(AddTrainPathOperator)
     bpy.utils.register_class(ClearConstraintsOperator)
     bpy.utils.register_class(UpdateConstraintsOperator)
-    bpy.utils.register_class(RotateBonesOperator)
+    #bpy.utils.register_class(RotateBonesOperator)
     bpy.utils.register_class(TrainAnimationPanel)
     bpy.utils.register_class(TrainAnimationProperties)
+    
     bpy.types.Scene.train_anim_properties = bpy.props.PointerProperty(type=TrainAnimationProperties)
 
 def unregister():
     bpy.utils.unregister_class(AddTrainPathOperator)
     bpy.utils.unregister_class(ClearConstraintsOperator)
     bpy.utils.unregister_class(UpdateConstraintsOperator)
-    bpy.utils.unregister_class(RotateBonesOperator)
+    #bpy.utils.unregister_class(RotateBonesOperator)
     bpy.utils.unregister_class(TrainAnimationPanel)
     bpy.utils.unregister_class(TrainAnimationProperties)
+    
     del bpy.types.Scene.train_anim_properties
 
 if __name__ == "__main__":

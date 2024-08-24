@@ -1,338 +1,553 @@
 import bpy
-import bmesh
-import math
-from mathutils import Vector, Matrix
+import mathutils
+from mathutils import Vector
+import time
+def calculate_bone_midpoint(bone):
+    """Calculate the midpoint of a given bone."""
+    head = boneQ.head
+    tail = bone.tail
+    midpoint = (head + tail) / 2
+    return midpoint
 
-def create_segmented_plane(bone_count, bone_locations, width):
-    # Create a new mesh for the plane
-    mesh = bpy.data.meshes.new("Train_Path")
-    plane = bpy.data.objects.new("Train_Path", mesh)
-    bpy.context.collection.objects.link(plane)
-    
-    bm = bmesh.new()
-    
-    for location in bone_locations:
-        half_width = width / 2
-        # Create vertices on either side of the bone head location along the Y axis (since bones are vertical)
-        v1 = bm.verts.new(location + Vector((-half_width, 0, 0)))  # Left vertex
-        v2 = bm.verts.new(location + Vector((half_width, 0, 0)))   # Right vertex
-        bm.verts.ensure_lookup_table()
-        
-        # Create an edge between the current pair of vertices
-        bm.edges.new((v1, v2))
-    
-    # Create edges between the pairs of vertices to form a continuous path
-    for i in range(bone_count - 1):
-        bm.edges.new((bm.verts[i*2], bm.verts[(i+1)*2]))       # Connect left vertices
-        bm.edges.new((bm.verts[i*2+1], bm.verts[(i+1)*2+1]))   # Connect right vertices
-    
-    # Create faces
-    for i in range(bone_count - 1):
-        bm.faces.new((bm.verts[i*2], bm.verts[i*2+1], bm.verts[(i+1)*2+1], bm.verts[(i+1)*2]))
-    
-    bm.to_mesh(mesh)
-    bm.free()
-    
-    # Create vertex groups based on sorted bone locations
-    for i, _ in enumerate(bone_locations):
-        vg = plane.vertex_groups.new(name=f"Bone_{i+1}")
-        vg.add([i*2, i*2+1], 1.0, 'REPLACE')
-    
-    return plane
+def bone_length(bone):
+    """Calculate the length of a given bone."""
+    return (bone.head - bone.tail).length
 
-def setup_bone_constraints(armature, plane, loc_axis, loc_inverse, rot_axis, rot_inverse, loc_offset, influence):
-    sorted_bones = sorted(
-        (bone for bone in armature.pose.bones if bone.bone.select),
-        key=lambda b: (armature.matrix_world @ b.head).y
-    )
+def is_point_in_bone_bounds(point, bone):
+    """Check if a point is within the bounds of a bone."""
+    head = bone.head
+    tail = bone.tail
+    bone_direction = tail - head
+    point_direction = point - head
+    projection = point_direction.project(bone_direction)
+    projected_point = head + projection
+    return (projected_point - head).length <= bone_length(bone)
+
+def go_to_pose_mode(context, armature):
+    context.view_layer.objects.active = armature
+    bpy.ops.object.mode_set(mode='POSE')
+
+def go_to_edit_mode(armature):
+    bpy.context.view_layer.objects.active = armature
+    bpy.ops.object.mode_set(mode='EDIT')
+
+def safe_string(s):
+    try:
+        return s.encode('utf-8').decode('utf-8')
+    except UnicodeDecodeError as e:
+        print(f"Encoding error: {e}, in string: {repr(s)}")
+        return ''.join([c if ord(c) < 128 else '?' for c in s])
+def verify_bone_hierarchy(operator, armature):
+    def report_hierarchy(bone, level=0):
+        operator.report({'INFO'}, "|  " * level + "+- " + bone.name)
+        for child in bone.children:
+            report_hierarchy(child, level + 1)
+
+    root_bones = [bone for bone in armature.data.bones if not bone.parent]
+    for root in root_bones:
+        report_hierarchy(root)
+def sort_and_parent(operator,context, armature):
     
-    for i, bone in enumerate(sorted_bones):
-        # Remove existing constraints
-        for constraint in bone.constraints:
-            bone.constraints.remove(constraint)
-        
-        # Copy Location constraint
-        loc_constraint = bone.constraints.new('COPY_LOCATION')
-        loc_constraint.target = plane
-        loc_constraint.subtarget = f"Bone_{i+1}"
-        loc_constraint.use_offset = loc_offset
-        loc_constraint.target_space = 'WORLD'
-        loc_constraint.owner_space = 'WORLD'
-        
-        loc_constraint.use_x = 'X' in loc_axis
-        loc_constraint.use_y = 'Y' in loc_axis
-        loc_constraint.use_z = 'Z' in loc_axis
-        loc_constraint.invert_x = 'X' in loc_inverse
-        loc_constraint.invert_y = 'Y' in loc_inverse
-        loc_constraint.invert_z = 'Z' in loc_inverse
-        loc_constraint.influence = influence
-        loc_constraint.mute = False
-        loc_constraint.show_expanded = True
-        loc_constraint.name = f"Copy Loc {i+1}"
-        
-        # Copy Rotation constraint
-        rot_constraint = bone.constraints.new('COPY_ROTATION')
-        rot_constraint.target = plane
-        rot_constraint.subtarget = f"Bone_{i+1}"
-        rot_constraint.use_offset = loc_offset
-        rot_constraint.target_space = 'WORLD'
-        rot_constraint.owner_space = 'WORLD'
-        
-        rot_constraint.use_x = 'X' in rot_axis
-        rot_constraint.use_y = 'Y' in rot_axis
-        rot_constraint.use_z = 'Z' in rot_axis
-        rot_constraint.invert_x = 'X' in rot_inverse
-        rot_constraint.invert_y = 'Y' in rot_inverse
-        rot_constraint.invert_z = 'Z' in rot_inverse
-        rot_constraint.influence = influence
-        rot_constraint.mute = False
-        rot_constraint.show_expanded = True
-        rot_constraint.name = f"Copy Rot {i+1}"
-
-def rotate_bones_to_path(armature):
-    bones = [bone for bone in armature.pose.bones if bone.bone.select]
+   
+    safe_report(operator, {'INFO'}, "sort_and_parent")
+    armature = bpy.context.active_object
+    if armature.type != 'ARMATURE':
+        return
+    # Enter edit mode on the armature
+    context.view_layer.objects.active = armature
+    bpy.ops.object.mode_set(mode='EDIT')
     
-    if len(bones) < 2:
-        return  # Need at least two bones to determine direction
+    sorted_bones = sorted(armature.data.edit_bones, key=lambda b: b.head.y)
+    # Find the root bone (no parent)
+    existing_root = next((bone for bone in armature.data.edit_bones if not bone.parent), None)
+    
+    
+    for i, child_bone in enumerate(sorted_bones):
+        if i == 0 and existing_root:
+            child_bone.parent = existing_root
+            #armature.data.edit_bones.link(child_bone)
+        elif i > 0:
+            child_bone.parent = sorted_bones[i-1]
+            #armature.data.edit_bones.link(child_bone, parent=sorted_bones[i-1])
+        child_bone.use_connect = False
+    
+    bpy.ops.object.mode_set(mode='OBJECT')
+    
+    
+    
+    
+    
+    
+    
+    def report_hierarchy(bone, level=0):
+        operator.report({'INFO'}, "|  " * level + "-- " + bone.name)
+        for child in bone.children:
+            report_hierarchy(child, level + 1)
 
-    for i in range(len(bones) - 1):
-        current_bone = bones[i]
-        next_bone = bones[i + 1]
-        
-        # Calculate direction vector between current and next bone
-        direction = next_bone.head - current_bone.head
-        direction.normalize()
-        
-        # Calculate rotation from vertical (Z-axis) to new direction
-        axis = Vector((0, 0, 1)).cross(direction)
-        angle = math.acos(Vector((0, 0, 1)).dot(direction))
-        
-        # Create rotation matrix
-        rotation_matrix = Matrix.Rotation(angle, 4, axis)
-        
-        # Apply rotation to the bone
-        current_bone.matrix_basis = rotation_matrix @ current_bone.matrix_basis
+    root_bones = [bone for bone in armature.data.bones if not bone.parent]
+    for root in root_bones:
+        report_hierarchy(root)
+def get_bone_parenting_chain(bone):
+    """Get the parenting chain of a bone back to the root."""
+    chain = []
+    while bone:
+        chain.append(bone.name)
+        bone = bone.parent
+    return " -> ".join(reversed(chain))
 
-    # Rotate the last bone to match the direction of the previous bone
-    if len(bones) > 1:
-        last_bone = bones[-1]
-        last_direction = last_bone.head - bones[-2].head
-        last_direction.normalize()
-        
-        axis = Vector((0, 0, 1)).cross(last_direction)
-        angle = math.acos(Vector((0, 0, 1)).dot(last_direction))
-        
-        rotation_matrix = Matrix.Rotation(angle, 4, axis)
-        last_bone.matrix_basis = rotation_matrix @ last_bone.matrix_basis
+def find_potential_parent(armature, child_bone, bones):
+    """Find a potential parent for a given bone."""
+    child_midpoint = calculate_bone_midpoint(child_bone)
+    potential_parents = [
+        bone for bone in bones 
+        if bone != child_bone and is_point_in_bone_bounds(child_midpoint, bone)
+    ]
+    if potential_parents:
+        return max(potential_parents, key=bone_length)
+    return None
+def parent_bones_handler(sorted_bones):
+    safe_report(operator, {'INFO'}, "handler")
+    armature = bpy.context.active_object
+    if armature.type != 'ARMATURE':
+        return
+    
+    # Check if the armature is in edit mode
+    if bpy.context.mode != 'EDIT_ARMATURE':
+        bpy.ops.object.mode_set(mode='EDIT')
+    
+    # Find the root bone (no parent)
+    existing_root = next((bone for bone in armature.data.edit_bones if not bone.parent), None)
+    
+    # Assume sorted_bones are globally available or passed via handler argument
+    for i, child_bone in enumerate(sorted_bones):
+        if i == 0 and existing_root:
+            child_bone.parent = existing_root
+        elif i > 0:
+            child_bone.parent = sorted_bones[i-1]
+        child_bone.use_connect = False
+    
+    bpy.ops.object.mode_set(mode='OBJECT')
+    
+    # Remove handler after execution
+    #bpy.app.handlers.depsgraph_update_post.remove(parent_bones_handler)
+    print("Bones parented successfully.")
 
-    # Update the armature
-    armature.data.update_tag()
-    bpy.context.view_layer.update()
+def bones_algorithm(operator, context, armature, objects, full_length=False):
+    
+    sorted_bones = []
+    
+    def create_and_sort_bones(objects, armature):
+        new_bones = []
+        for obj in objects:
+            if obj.type != 'MESH':
+                continue
+            bone = add_bone_to_object(obj, armature, full_length)
+            if bone:
+                new_bones.append(bone)
+        time.sleep(.02)
+        # Print information about bones before sorting
+        #safe_report(operator, {'INFO'}, "Bones before sorting:")
+        #for i, bone in enumerate(new_bones):
+        #    safe_report(operator, {'INFO'}, f"Bone {i}: Name: {bone.name}, Head Y: {bone.head.y:.4f}")
+        bpy.context.view_layer.update()
+        sorted_bones = sorted(new_bones, key=lambda b: b.head.y)
+        
+        # Print information about bones after sorting
+        #safe_report(operator, {'INFO'}, "Bones after sorting:")
+        #for i, bone in enumerate(sorted_bones):
+            #safe_report(operator, {'INFO'}, f"Bone {i}: Name: {bone.name}, Head Y: {bone.head.y:.4f}")
+        
+        return sorted_bones
 
-class RotateBonesOperator(bpy.types.Operator):
-    bl_idname = "object.rotate_bones"
-    bl_label = "Rotate Bones"
+    try:
+        bpy.context.view_layer.objects.active = armature
+        sorted_bones = create_and_sort_bones(objects, armature)
+        bpy.context.view_layer.update()
+        
+        if sorted_bones:#this doesn't work, but lets see if it works
+            def delayed_parent_bones():
+                safe_report(operator, {'INFO'}, "Parenting bones...")
+                parent_bones_handler(sorted_bones, armature)  # Pass armature argument
+                return None
+            bpy.app.timers.register(delayed_parent_bones, first_interval=0.01)
+
+        safe_report(operator, {'INFO'}, "Parenting operation initiated.")
+    except Exception as e:
+        safe_report(operator, {'ERROR'}, f"Error during bone creation and sorting: {str(e)}")
+def create_bone(armature, name, head, tail, roll=0):
+    """
+    Create a new bone in the given armature.
+    
+    :param armature: The armature object
+    :param name: Name of the new bone
+    :param head: Head position of the bone
+    :param tail: Tail position of the bone
+    :param roll: Roll of the bone
+    :return: The newly created bone
+    """
+    bone = armature.data.edit_bones.new(safe_string(name))
+    bone.head = head
+    bone.tail = tail
+    bone.roll = roll
+    return bone
+
+def safe_report(operator, level, message):
+    try:
+        operator.report(level, safe_string(message))
+    except UnicodeDecodeError as e:
+        print(f"Encoding error in report message: {e}, message: {repr(message)}")
+        operator.report({'ERROR'}, f"Encoding error in report message: {str(e)}")
+
+def is_wheel(obj):
+    if not bpy.context.scene.check_for_wheels:
+        return False
+    world_bbox = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+    dimensions = Vector((
+        max(v.x for v in world_bbox) - min(v.x for v in world_bbox),
+        max(v.y for v in world_bbox) - min(v.y for v in world_bbox),
+        max(v.z for v in world_bbox) - min(v.z for v in world_bbox)
+    ))
+    return abs(dimensions.x - dimensions.z) < 0.001 and dimensions.y < min(dimensions.x, dimensions.z)
+
+def add_bone_to_object(obj, armature, full_length=False):
+    try:
+        if obj is None or armature is None:
+            print("Invalid object or armature")
+            return None
+
+        bpy.context.view_layer.objects.active = armature
+        bpy.ops.object.mode_set(mode='EDIT')
+
+        world_bbox = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+        world_center = sum(world_bbox, Vector()) / 8
+        world_dims = Vector((
+            max(v.x for v in world_bbox) - min(v.x for v in world_bbox),
+            max(v.y for v in world_bbox) - min(v.y for v in world_bbox),
+            max(v.z for v in world_bbox) - min(v.z for v in world_bbox)
+        ))
+
+        obj_loc = armature.matrix_world.inverted() @ world_center
+
+        if is_wheel(obj):
+            bone_length = max(world_dims.x, world_dims.z)
+            bone_dir = Vector((0, 0, 1))  # Use Z-axis for wheels
+        else:
+            bone_length = world_dims.y
+            bone_dir = Vector((0, 1, 0))  # Use Y-axis for non-wheels
+
+        if full_length:
+            head = obj_loc - (bone_dir * bone_length / 2)
+            tail = obj_loc + (bone_dir * bone_length / 2)
+        else:
+            head = obj_loc
+            tail = obj_loc + (bone_dir * bone_length)
+
+        bone_name = obj.name
+        bone = create_bone(armature, bone_name, head, tail)
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        if not any(mod.type == 'ARMATURE' and mod.object == armature for mod in obj.modifiers):
+            armature_modifier = obj.modifiers.new(name="Armature", type='ARMATURE')
+            armature_modifier.object = armature
+
+        vertex_group = obj.vertex_groups.new(name=bone_name)
+        vertex_group.add(range(len(obj.data.vertices)), 1.0, 'REPLACE')
+
+        return bone
+    except Exception as e:
+        print(f"Error in add_bone_to_object: {e}")
+        if bpy.context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        return None
+
+
+
+class OBJECT_OT_add_bone(bpy.types.Operator):
+    bl_idname = "object.add_bone"
+    bl_label = "Add Bone"
+    bl_description = "Add a bone at the selected object's origin and set up weights"
     bl_options = {'REGISTER', 'UNDO'}
-    
+
     def execute(self, context):
-        armature = context.active_object
-        if armature.type != 'ARMATURE':
-            self.report({'ERROR'}, "Active object must be an armature")
+        try:
+            obj = context.object
+            armature = context.scene.selected_armature
+            go_to_pose_mode_flag = context.scene.go_to_pose_mode
+            full_length = context.scene.full_length_bone
+            weight_method = context.scene.weight_method
+
+            if obj and armature and obj != armature:
+                if obj.name not in context.scene.objects:
+                    self.report({'WARNING'}, "Selected object is no longer valid.")
+                    return {'CANCELLED'}
+
+                add_bone_to_object(obj, armature, full_length)
+
+                if weight_method == 'ENVELOPE':
+                    bpy.ops.object.parent_set(type='ARMATURE_ENVELOPE')
+                elif weight_method == 'AUTO':
+                    bpy.ops.object.parent_set(type='ARMATURE_AUTO')
+
+                if go_to_pose_mode_flag:
+                    bpy.ops.object.mode_set(mode='POSE')
+
+                self.report({'INFO'}, f"Bone added, parented, and weights assigned using {weight_method} method.")
+                return {'FINISHED'}
+
+            else:
+                self.report({'WARNING'}, "No object or armature selected, or object is the same as armature.")
+                return {'CANCELLED'}
+
+        except Exception as e:
+            self.report({'ERROR'}, f"Error in add_bone_to_object: {str(e)}")
             return {'CANCELLED'}
-        
-        # Rotate bones to proper orientation
-        rotate_bones_to_path(armature)
-        
+
+class OBJECT_OT_generate_rig(bpy.types.Operator):
+    bl_idname = "object.generate_rig"
+    bl_label = "Generate Rig"
+    bl_description = "Generate rig with custom parenting algorithm"
+
+    def execute(self, context):
+        armature = context.scene.selected_armature
+        full_length = context.scene.full_length_bone
+        if not armature:
+            self.report({'WARNING'}, "No armature selected")
+            return {'CANCELLED'}
+
+        objects = context.selected_objects
+        if not objects:
+            self.report({'WARNING'}, "No objects selected")
+            return {'CANCELLED'}
+
+        try:
+            # Ensure we're in Object Mode before starting
+            bpy.ops.object.mode_set(mode='OBJECT')
+            
+            # Select the armature and enter Edit Mode
+            bpy.context.view_layer.objects.active = armature
+            bpy.ops.object.mode_set(mode='EDIT')
+            
+            bones_algorithm(self, context, armature, objects, full_length)
+            bpy.context.view_layer.objects.active = armature
+            bpy.ops.object.mode_set(mode='EDIT')
+            # Crucial: Apply the changes before exiting Edit Mode
+            #bpy.ops.armature.select_all(action='SELECT')
+            #bpy.ops.armature.parent_set(type='OFFSET')
+            
+            # Return to Object Mode
+            bpy.ops.object.mode_set(mode='OBJECT')
+            sort_and_parent(self,context, armature)
+            # Return to Object Mode
+            bpy.ops.object.mode_set(mode='OBJECT')
+            # Verify the bone hierarchy
+            verify_bone_hierarchy(self, armature)
+        except Exception as e:
+            self.report({'ERROR'}, f"Error during rig generation: {str(e)}")
+            if bpy.context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, "Rig generated successfully")
         return {'FINISHED'}
 
-class AddTrainPathOperator(bpy.types.Operator):
-    bl_idname = "object.add_train_path"
-    bl_label = "Add Train Path"
-    bl_options = {'REGISTER', 'UNDO'}
-    
-    def execute(self, context):
-        armature = context.active_object
-        if armature.type != 'ARMATURE':
-            self.report({'ERROR'}, "Active object must be an armature")
-            return {'CANCELLED'}
-        
-        bone_count = len([b for b in armature.data.bones if b.select])
-        if bone_count < 2:
-            self.report({'ERROR'}, "At least two bones must be selected")
-            return {'CANCELLED'}
-        
-        # Rotate bones to proper orientation
-        rotate_bones_to_path(armature)
-        
-        # Get bone head locations and sort by Y axis
-        bone_locations = sorted((bone.head for bone in armature.pose.bones if bone.bone.select), key=lambda v: v.y)
-        
-        plane = create_segmented_plane(bone_count, bone_locations, 1)
-        props = context.scene.train_anim_properties
-        setup_bone_constraints(armature, plane, props.loc_axis, props.loc_inverse, props.rot_axis, props.rot_inverse, props.loc_offset, props.influence)
-        
-        return {'FINISHED'}
 
-class ClearConstraintsOperator(bpy.types.Operator):
-    bl_idname = "object.clear_train_constraints"
-    bl_label = "Clear Train Constraints"
-    bl_options = {'REGISTER', 'UNDO'}
-    
-    def execute(self, context):
-        armature = context.active_object
-        if armature.type != 'ARMATURE':
-            self.report({'ERROR'}, "Active object must be an armature")
-            return {'CANCELLED'}
-        
-        for bone in armature.pose.bones:
-            for constraint in bone.constraints:
-                bone.constraints.remove(constraint)
-        
-        return {'FINISHED'}
-
-class TrainAnimationProperties(bpy.types.PropertyGroup):
-    loc_axis: bpy.props.EnumProperty(
-        items=[('X', 'X', 'X Axis'),
-               ('Y', 'Y', 'Y Axis'),
-               ('Z', 'Z', 'Z Axis'),
-               ('XY', 'X Y', 'X and Y Axes'),
-               ('XZ', 'X Z', 'X and Z Axes'),
-               ('YZ', 'Y Z', 'Y and Z Axes'),
-               ('XYZ', 'X Y Z', 'All Axes')],
-        name="Location Axis",
-        default='XYZ'
-    )
-    
-    loc_inverse: bpy.props.EnumProperty(
-        items=[('NONE', 'None', 'None'),
-               ('X', 'X', 'Inverse X'),
-               ('Y', 'Y', 'Inverse Y'),
-               ('Z', 'Z', 'Inverse Z'),
-               ('XY', 'X Y', 'Inverse X and Y'),
-               ('XZ', 'X Z', 'Inverse X and Z'),
-               ('YZ', 'Y Z', 'Inverse Y and Z'),
-               ('XYZ', 'X Y Z', 'Inverse All')],
-        name="Location Inverse",
-        default='NONE'
-    )
-    
-    rot_axis: bpy.props.EnumProperty(
-        items=[('X', 'X', 'X Axis'),
-               ('Y', 'Y', 'Y Axis'),
-               ('Z', 'Z', 'Z Axis'),
-               ('XY', 'X Y', 'X and Y Axes'),
-               ('XZ', 'X Z', 'X and Z Axes'),
-               ('YZ', 'Y Z', 'Y and Z Axes'),
-               ('XYZ', 'X Y Z', 'All Axes')],
-        name="Rotation Axis",
-        default='XYZ'
-    )
-    
-    rot_inverse: bpy.props.EnumProperty(
-        items=[('NONE', 'None', 'None'),
-               ('X', 'X', 'Inverse X'),
-               ('Y', 'Y', 'Inverse Y'),
-               ('Z', 'Z', 'Inverse Z'),
-               ('XY', 'X Y', 'Inverse X and Y'),
-               ('XZ', 'X Z', 'Inverse X and Z'),
-               ('YZ', 'Y Z', 'Inverse Y and Z'),
-               ('XYZ', 'X Y Z', 'Inverse All')],
-        name="Rotation Inverse",
-        default='NONE'
-    )
-
-    loc_offset: bpy.props.BoolProperty(
-        name="Location Offset",
-        description="Use offset for location constraints",
-        default=False
-    )
-
-    influence: bpy.props.FloatProperty(
-        name="Influence",
-        description="Influence of the constraint",
-        default=1.0,
-        min=0.0,
-        max=1.0
-    )
-
-class TrainAnimationPanel(bpy.types.Panel):
-    bl_label = "Train Animation"
-    bl_idname = "OBJECT_PT_train_animation"
+class VIEW3D_PT_custom_panel(bpy.types.Panel):
+    bl_label = "Bonify"
+    bl_idname = "VIEW3D_PT_custom_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'Tool'
 
     def draw(self, context):
         layout = self.layout
-        props = context.scene.train_anim_properties
-        layout.prop(props, "loc_axis")
-        layout.prop(props, "loc_inverse")
-        layout.prop(props, "rot_axis")
-        layout.prop(props, "rot_inverse")
-        layout.prop(props, "loc_offset")
-        layout.prop(props, "influence")
-        layout.operator(AddTrainPathOperator.bl_idname)
-        layout.operator(ClearConstraintsOperator.bl_idname)
-        layout.operator(RotateBonesOperator.bl_idname)
-        
-        if context.active_object and context.active_object.type == 'ARMATURE':
-            layout.operator(UpdateConstraintsOperator.bl_idname)
+        layout.label(text="Select Armature:")
+        for armature in bpy.data.objects:
+            if armature.type == 'ARMATURE':
+                layout.operator("object.select_armature", text=armature.name).armature_name = armature.name
 
-class UpdateConstraintsOperator(bpy.types.Operator):
-    bl_idname = "object.update_train_constraints"
-    bl_label = "Update Train Constraints"
-    bl_options = {'REGISTER', 'UNDO'}
-    
+        layout.label(text="Parent Bone:")
+        row = layout.row(align=True)
+        row.operator("object.select_parent_bone", text="Select Parent Bone")
+        row.operator("object.clear_selected_parent_bone", text="", icon='X')
+
+        if context.scene.selected_parent_bone:
+            layout.label(text=f"Selected: {context.scene.selected_parent_bone}")
+        else:
+            layout.prop(context.scene, "selected_axes", text="Axes for Closest Bone")
+
+        layout.prop(context.scene, "go_to_pose_mode", text="Go to Pose Mode After Adding Bone")
+        layout.prop(context.scene, "full_length_bone", text="Full Length Bone")
+        layout.prop(context.scene, "check_for_wheels", text="Check for Wheels")
+        layout.prop(context.scene, "weight_method", text="Weight Method")
+        layout.prop(context.scene, "main_chain_cutoff", text="Main Chain Cutoff (%)")
+        layout.operator("object.add_bone", text="Add Bone", icon='BONE_DATA')
+        layout.operator("object.generate_rig", text="Generate Rig")
+        layout.operator("object.clear_all_bones_except_root", text="Clear All Bones Except Root", icon='BONE_DATA')
+
+        layout.label(text="Bone Chain:")
+        obj = context.object
+        if obj and obj.type == 'MESH' and obj.vertex_groups:
+            armature = context.scene.selected_armature
+            if armature:
+                for vgroup in obj.vertex_groups:
+                    bone_name = vgroup.name
+                    if bone_name in armature.data.bones:
+                        bone = armature.data.bones[bone_name]
+                        chain = get_bone_parenting_chain(bone)
+                        layout.label(text=f"{bone_name}: {chain}")
+        else:
+            layout.label(text="No weight painted bones found")
+
+class OBJECT_OT_select_armature(bpy.types.Operator):
+    bl_idname = "object.select_armature"
+    bl_label = "Select Armature"
+    bl_description = "Select an armature for adding bones"
+
+    armature_name: bpy.props.StringProperty()
+
     def execute(self, context):
-        armature = context.active_object
-        if armature.type != 'ARMATURE':
-            self.report({'ERROR'}, "Active object must be an armature")
-            return {'CANCELLED'}
-        
-        plane = bpy.data.objects.get("Train_Path")
-        if not plane:
-            self.report({'ERROR'}, "Train_Path object not found")
-            return {'CANCELLED'}
-        
-        # Get bone head locations and sort by Y axis
-        armature_matrix = armature.matrix_world
-        bone_locations = sorted(
-            (armature_matrix @ bone.head for bone in armature.pose.bones if bone.bone.select),
-            key=lambda v: v.y
-        )
-        
-        # Update constraints with the panel properties
-        props = context.scene.train_anim_properties
-        setup_bone_constraints(
-            armature, 
-            plane, 
-            props.loc_axis, 
-            props.loc_inverse, 
-            props.rot_axis, 
-            props.rot_inverse,
-            props.loc_offset,
-            props.influence
-        )
-        
+        armature = bpy.data.objects.get(self.armature_name)
+        if armature and armature.type == 'ARMATURE':
+            context.scene.selected_armature = armature
+            self.report({'INFO'}, f"Selected armature: {armature.name}")
+        else:
+            self.report({'WARNING'}, "Armature not found or invalid")
         return {'FINISHED'}
 
+class OBJECT_OT_select_parent_bone(bpy.types.Operator):
+    bl_idname = "object.select_parent_bone"
+    bl_label = "Select Parent Bone"
+    bl_description = "Manually select the parent bone for the new bone"
+
+    def execute(self, context):
+        armature = context.scene.selected_armature
+        if armature and armature.type == 'ARMATURE':
+            if bpy.context.mode != 'EDIT_ARMATURE':
+                bpy.ops.object.mode_set(mode='EDIT')
+            active_bone = armature.data.edit_bones.active
+            if active_bone:
+                context.scene.selected_parent_bone = safe_string(active_bone.name)
+                context.scene.selected_axes = set()
+                safe_report(self, {'INFO'}, f"Selected parent bone: {safe_string(active_bone.name)}")
+            else:
+                safe_report(self, {'WARNING'}, "No active bone selected")
+            if bpy.context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+        else:
+            safe_report(self, {'WARNING'}, "No armature selected or invalid armature")
+        return {'FINISHED'}
+
+class OBJECT_OT_clear_selected_parent_bone(bpy.types.Operator):
+    bl_idname = "object.clear_selected_parent_bone"
+    bl_label = "Clear Parent Bone"
+    bl_description = "Clear the manually selected parent bone"
+
+    def execute(self, context):
+        context.scene.selected_parent_bone = ""
+        self.report({'INFO'}, "Cleared selected parent bone")
+        return {'FINISHED'}
+
+class OBJECT_OT_clear_all_bones_except_root(bpy.types.Operator):
+    bl_idname = "object.clear_all_bones_except_root"
+    bl_label = "Clear All Bones Except Root"
+    bl_description = "Clear all bones from the selected armature except the root bone"
+
+    def execute(self, context):
+        armature = context.scene.selected_armature
+        if armature and armature.type == 'ARMATURE':
+            bpy.context.view_layer.objects.active = armature
+            if bpy.context.mode != 'EDIT_ARMATURE':
+                bpy.ops.object.mode_set(mode='EDIT')
+            root_bone = next((bone for bone in armature.data.edit_bones if not bone.parent), None)
+            if root_bone:
+                bones_to_remove = [bone for bone in armature.data.edit_bones if bone != root_bone]
+                for bone in bones_to_remove:
+                    armature.data.edit_bones.remove(bone)
+            if bpy.context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            self.report({'INFO'}, "All bones except the root have been cleared.")
+            return {'FINISHED'}
+        else:
+            self.report({'WARNING'}, "No valid armature selected.")
+            return {'CANCELLED'}
+
 def register():
-    bpy.utils.register_class(AddTrainPathOperator)
-    bpy.utils.register_class(ClearConstraintsOperator)
-    bpy.utils.register_class(UpdateConstraintsOperator)
-    bpy.utils.register_class(RotateBonesOperator)
-    bpy.utils.register_class(TrainAnimationPanel)
-    bpy.utils.register_class(TrainAnimationProperties)
-    bpy.types.Scene.train_anim_properties = bpy.props.PointerProperty(type=TrainAnimationProperties)
+    bpy.utils.register_class(OBJECT_OT_add_bone)
+    bpy.utils.register_class(OBJECT_OT_generate_rig)
+    bpy.utils.register_class(OBJECT_OT_select_armature)
+    bpy.utils.register_class(OBJECT_OT_select_parent_bone)
+    bpy.utils.register_class(OBJECT_OT_clear_selected_parent_bone)
+    bpy.utils.register_class(OBJECT_OT_clear_all_bones_except_root)
+    bpy.utils.register_class(VIEW3D_PT_custom_panel)
+    bpy.types.Scene.selected_armature = bpy.props.PointerProperty(type=bpy.types.Object)
+    bpy.types.Scene.selected_axes = bpy.props.EnumProperty(
+        name="Axes",
+        description="Axes to find the closest bone",
+        items=[
+            ('X', "X Axis", "Find the closest bone on the X axis"),
+            ('-X', "-X Axis", "Find the closest bone on the negative X axis"),
+            ('Y', "Y Axis", "Find the closest bone on the Y axis"),
+            ('-Y', "-Y Axis", "Find the closest bone on the negative Y axis"),
+            ('Z', "Z Axis", "Find the closest bone on the Z axis"),
+            ('-Z', "-Z Axis", "Find the closest bone on the negative Z axis")
+        ],
+        options={'ENUM_FLAG'},
+        default={'Z'}
+    )
+    bpy.types.Scene.go_to_pose_mode = bpy.props.BoolProperty(
+        name="Go to Pose Mode",
+        description="Toggle to go to Pose Mode after adding the bone",
+        default=False
+    )
+    bpy.types.Scene.selected_parent_bone = bpy.props.StringProperty(
+        name="Selected Parent Bone",
+        description="Name of the manually selected parent bone"
+    )
+    bpy.types.Scene.full_length_bone = bpy.props.BoolProperty(
+        name="Full Length Bone",
+        description="Toggle to create full-length bones from bottom to top of object",
+        default=False
+    )
+    bpy.types.Scene.check_for_wheels = bpy.props.BoolProperty(
+        name="Check for Wheels",
+        description="Toggle to check if objects are wheels based on their dimensions",
+        default=True
+    )
+    bpy.types.Scene.weight_method = bpy.props.EnumProperty(
+        name="Weight Method",
+        description="Choose the method for weight assignment",
+        items=[
+            ('ENVELOPE', "Envelope Weights", "Assign weights using envelope method"),
+            ('AUTO', "Automatic Weights", "Assign weights automatically")
+        ],
+        default='AUTO'
+    )
+    bpy.types.Scene.main_chain_cutoff = bpy.props.FloatProperty(
+        name="Main Chain Cutoff",
+        description="Percentage of the largest bone's length to be considered as main chain",
+        default=36.0,
+        min=0.0,
+        max=100.0,
+        subtype='PERCENTAGE'
+    )
 
 def unregister():
-    bpy.utils.unregister_class(AddTrainPathOperator)
-    bpy.utils.unregister_class(ClearConstraintsOperator)
-    bpy.utils.unregister_class(UpdateConstraintsOperator)
-    bpy.utils.unregister_class(RotateBonesOperator)
-    bpy.utils.unregister_class(TrainAnimationPanel)
-    bpy.utils.unregister_class(TrainAnimationProperties)
-    del bpy.types.Scene.train_anim_properties
+    bpy.utils.unregister_class(OBJECT_OT_add_bone)
+    bpy.utils.unregister_class(OBJECT_OT_generate_rig)
+    bpy.utils.unregister_class(OBJECT_OT_select_armature)
+    bpy.utils.unregister_class(OBJECT_OT_select_parent_bone)
+    bpy.utils.unregister_class(OBJECT_OT_clear_selected_parent_bone)
+    bpy.utils.unregister_class(OBJECT_OT_clear_all_bones_except_root)
+    bpy.utils.unregister_class(VIEW3D_PT_custom_panel)
+    del bpy.types.Scene.selected_armature
+    del bpy.types.Scene.selected_axes
+    del bpy.types.Scene.go_to_pose_mode
+    del bpy.types.Scene.selected_parent_bone
+    del bpy.types.Scene.full_length_bone
+    del bpy.types.Scene.check_for_wheels
+    del bpy.types.Scene.weight_method
+    del bpy.types.Scene.main_chain_cutoff
 
 if __name__ == "__main__":
     register()
