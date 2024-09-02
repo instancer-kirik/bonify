@@ -1,6 +1,6 @@
 # bonify
 add bones to objects in blender, with auto weighting and parent finding, also you can manually select parent
-
+CURRENTLY ONLY PARENTS BY Y POSITION, AAAAAAAAA IM WORKING ON THE FOLLOW CURVE PART NOW
 Instructions for now
 1. Click on Scripting workspace tab (Top) > Text > New > paste bonify.py > press Play button |> bonify controls in Tool menu
 
